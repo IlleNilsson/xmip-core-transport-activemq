@@ -32,10 +32,12 @@ use std::time::Duration;
 pub use client::{Client, Login, Message};
 pub use frame::Frame;
 pub use session::{Event, Queues, Session};
-use transport::error::Result;
+use transport::error::{Result, protocol_error};
+use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
 use transport::{Arrived, Directions, Transport};
 
+#[derive(Clone)]
 pub struct ActiveMqTransport {
     server: String,
     queue: String,
@@ -155,6 +157,60 @@ impl Transport for ActiveMqTransport {
         let mut client = Client::connect(&server, self.login.as_ref(), self.timeout)?;
         client.send(&destination, bytes)?;
         client.disconnect()
+    }
+}
+
+impl ActiveMqTransport {
+    /// Both ends on this machine: an ephemeral local port, the loopback
+    /// timeout, one queue called `/queue/probe`.
+    #[must_use]
+    pub fn loopback() -> Self {
+        Self::new("127.0.0.1:0", "/queue/probe").timing_out_after(LOOPBACK_TIMEOUT)
+    }
+}
+
+/// A bound listener waiting for its one client and its one SEND.
+struct Listening {
+    transport: ActiveMqTransport,
+    listener: TcpListener,
+    address: String,
+}
+
+impl FarEnd for Listening {
+    fn address(&self) -> &str {
+        &self.address
+    }
+
+    fn take_one(self: Box<Self>) -> Result<Arrived> {
+        let mut session = self.transport.accept_one(&self.listener)?;
+        let arrived = session
+            .next_send()?
+            .ok_or_else(|| protocol_error("the client disconnected without sending"))?;
+        // The client DISCONNECTs with a receipt and waits for it; serve it,
+        // and see the client go.
+        session.next_send()?;
+        Ok(arrived)
+    }
+}
+
+impl Loopback for ActiveMqTransport {
+    fn far_end(&self) -> Result<Box<dyn FarEnd>> {
+        let (listener, address) = self.bind()?;
+        Ok(Box::new(Listening {
+            transport: self.clone(),
+            listener,
+            address,
+        }))
+    }
+
+    /// A fresh client to `address`, one SEND with a receipt to this
+    /// transport's queue, and the DISCONNECT receipted before it returns.
+    fn send_to(&self, address: &str, payload: &[u8]) -> Result<()> {
+        Self {
+            server: address.to_string(),
+            ..self.clone()
+        }
+        .send(&self.queue, payload)
     }
 }
 
@@ -317,5 +373,51 @@ mod tests {
             transport.resolve("activemq://h:1"),
             ("h:1".to_string(), "/queue/x".to_string())
         );
+    }
+
+    #[test]
+    fn the_loopback_round_returns_the_payload_and_its_origin() {
+        let loopback = ActiveMqTransport::loopback();
+        let arrived = loopback.round(b"sent").expect("round");
+        assert_eq!(arrived.bytes, b"sent");
+        assert!(arrived.origin_uri.starts_with("activemq://127.0.0.1:"));
+        assert!(arrived.origin_uri.contains("/queue/probe"));
+        assert!(loopback.ceiling().is_none());
+        assert!(loopback.refuses(b"anything").is_none());
+    }
+
+    #[test]
+    fn the_loopback_returns_the_edge_payloads_whole() {
+        let loopback = ActiveMqTransport::loopback();
+        for (name, payload) in edge_payloads() {
+            let arrived = loopback.round(&payload).expect(name);
+            assert!(arrived.bytes == payload, "{name} came back changed");
+        }
+    }
+
+    /// The Playground's edge payloads, written here so the crate does not
+    /// depend on it: the shapes a framing fault changes.
+    fn edge_payloads() -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            ("empty", Vec::new()),
+            ("one byte", vec![0x2a]),
+            ("every byte", (0..=255).collect()),
+            ("nul run", vec![0; 512]),
+            ("high bytes", vec![0xff; 512]),
+            ("crlf storm", b"\r\n".repeat(400)),
+            ("mtu minus one", patterned(1_471)),
+            ("mtu", patterned(1_472)),
+            ("mtu plus one", patterned(1_473)),
+            ("udp maximum", patterned(65_507)),
+            ("sixteen bits plus one", patterned(65_537)),
+            ("a mebibyte", patterned(1 << 20)),
+        ]
+    }
+
+    /// `len` bytes a truncation, a reorder or a duplicate would change.
+    fn patterned(len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|at| u8::try_from((at * 31 + at / 251) % 256).unwrap_or(0))
+            .collect()
     }
 }
