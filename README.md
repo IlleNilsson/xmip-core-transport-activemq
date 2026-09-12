@@ -1,6 +1,6 @@
 # xmip-core-transport-activemq
 
-ActiveMQ transport: STOMP 1.2 to ActiveMQ Classic and Artemis — connect, send with receipt, subscribe with client-individual acknowledgement — a queue or topic is a Location. A technology of [xmip-core-transport](https://github.com/IlleNilsson/xmip-core-transport).
+ActiveMQ transport: STOMP 1.2 to ActiveMQ Classic and Artemis — connect, send with receipt, subscribe with client-individual acknowledgment — a queue or topic is a Location. A technology of [xmip-core-transport](https://github.com/IlleNilsson/xmip-core-transport).
 
 ## Toolchain
 
