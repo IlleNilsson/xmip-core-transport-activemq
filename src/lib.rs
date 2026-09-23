@@ -13,7 +13,7 @@
 //! Either may instead accept clients directly through [`Session`], one
 //! client's worth of broker.
 //!
-//! TLS is `xmip-core-tls`'s, per ADR-0033. `OpenWire`, the
+//! TLS is `xmip-core-library-tls`'s, per ADR-0033. `OpenWire`, the
 //! brokers' native protocol, is binary and versioned and would be its own
 //! technology; STOMP is what both brokers document for other languages.
 //!
