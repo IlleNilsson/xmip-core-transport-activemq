@@ -5,10 +5,10 @@ use std::io::{BufReader, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
+use net::authority::host_of;
 use transport::Arrived;
 use transport::error::{Result, classify, protocol_error};
 use transport::socket;
-use transport::wire::host_of;
 
 use crate::frame::{Frame, encode, read};
 
