@@ -29,14 +29,14 @@ pub mod session;
 use std::net::TcpListener;
 use std::time::Duration;
 
-pub use client::{Client, Login, Message};
+pub use client::{Client, Message};
 pub use frame::Frame;
 pub use session::{Event, Queues, Session};
 use transport::error::{Result, protocol_error};
 use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
-use transport::{Arrived, Configured, Directions, Transport};
+use transport::{Arrived, Configured, Directions, Login, Pool, Transport};
 use xcore::settings::{Applies, Kind, Presence, Read, Setting, Settings};
 
 #[derive(Clone)]
@@ -45,6 +45,8 @@ pub struct ActiveMqTransport {
     queue: String,
     login: Option<Login>,
     timeout: Option<Duration>,
+    /// The clients a send goes on, connected once per broker and kept.
+    clients: Pool<Client>,
 }
 
 impl ActiveMqTransport {
@@ -57,16 +59,14 @@ impl ActiveMqTransport {
             queue: queue.into(),
             login: None,
             timeout: None,
+            clients: Pool::new(),
         }
     }
 
     /// CONNECT as this user.
     #[must_use]
     pub fn with_login(mut self, user: &str, password: &str) -> Self {
-        self.login = Some(Login {
-            user: user.to_string(),
-            password: password.to_string(),
-        });
+        self.login = Some(Login::new(user, password));
         self
     }
 
@@ -154,11 +154,15 @@ impl Transport for ActiveMqTransport {
         Ok(arrived)
     }
 
+    /// SEND on the client kept for the broker, connected on the first send
+    /// to it, and wait for the receipt.
     fn send(&self, target: &str, bytes: &[u8]) -> Result<()> {
         let (server, destination) = self.resolve(target);
-        let mut client = Client::connect(&server, self.login.as_ref(), self.timeout)?;
-        client.send(&destination, bytes)?;
-        client.disconnect()
+        self.clients.exchange(
+            &server,
+            || Client::connect(&server, self.login.as_ref(), self.timeout),
+            |client| client.send(&destination, bytes),
+        )
     }
 }
 
@@ -209,13 +213,11 @@ impl ActiveMqTransport {
 impl Accepting for ActiveMqTransport {
     fn take_one(self, listener: &TcpListener) -> Result<Arrived> {
         let mut session = self.accept_one(listener)?;
-        let arrived = session
+        // The receipt goes out before the send is reported; the client keeps
+        // its connection for the next.
+        session
             .next_send()?
-            .ok_or_else(|| protocol_error("the client disconnected without sending"))?;
-        // The client DISCONNECTs with a receipt and waits for it; serve it,
-        // and see the client go.
-        session.next_send()?;
-        Ok(arrived)
+            .ok_or_else(|| protocol_error("the client disconnected without sending"))
     }
 }
 
@@ -224,8 +226,8 @@ impl Loopback for ActiveMqTransport {
         Ok(Box::new(Listening::new(self.clone(), self.bind()?)))
     }
 
-    /// A fresh client to `address`, one SEND with a receipt to this
-    /// transport's queue, and the DISCONNECT receipted before it returns.
+    /// A client to `address`, one SEND with a receipt to this transport's
+    /// queue, receipted before it returns.
     fn send_to(&self, address: &str, payload: &[u8]) -> Result<()> {
         Self {
             server: address.to_string(),
@@ -285,19 +287,15 @@ mod tests {
                 .timing_out_after(Duration::from_millis(300))
                 .receive()
         });
-        let mut queues = Queues::new();
+        // One broker, so one client for all three sends: connected once.
+        let mut session = far_end.accept_one(&listener).expect("accepting");
+        assert_eq!(session.connect().header("login"), Some("xmip"));
         for expected in [&b"order 1\r\nline 2"[..], b"", b"other"] {
-            let mut session = far_end
-                .accept_one(&listener)
-                .expect("accepting")
-                .with_queues(queues);
-            assert_eq!(session.connect().header("login"), Some("xmip"));
             let sent = session.next_send().expect("sent").expect("one");
             assert_eq!(sent.bytes, expected);
             assert!(sent.origin_uri.starts_with("activemq://127.0.0.1:"));
-            assert!(session.next_send().expect("disconnected").is_none());
-            queues = session.into_queues();
         }
+        let queues = session.into_queues();
         assert_eq!(queues["/queue/orders"].len(), 2);
         assert_eq!(queues["/queue/other"].len(), 1);
         let mut session = far_end
@@ -331,6 +329,41 @@ mod tests {
                 .origin_uri
                 .ends_with("/queue/orders?message-id=2")
         );
+    }
+
+    #[test]
+    fn a_thousand_sends_connect_once_and_a_client_the_broker_closed_is_replaced() {
+        const SENDS: usize = 1000;
+        let far_end = ActiveMqTransport::new("127.0.0.1:0", "/queue/orders")
+            .with_login("xmip", "secret")
+            .timing_out_after(secs(5));
+        let (listener, address) = far_end.bind().expect("binding");
+        let near = ActiveMqTransport::new(address, "/queue/orders")
+            .with_login("xmip", "secret")
+            .timing_out_after(secs(5));
+        let sending = near.clone();
+        let sender = std::thread::spawn(move || {
+            let began = std::time::Instant::now();
+            for n in 0..SENDS {
+                sending.send("/queue/orders", n.to_string().as_bytes())?;
+            }
+            let took = began.elapsed();
+            // Generous for a debug build under load: a millisecond a send.
+            assert!(took < Duration::from_millis(SENDS as u64), "{took:?}");
+            sending.send("/queue/orders", b"after the close")
+        });
+        // One CONNECT for every send: one session accepted.
+        let mut session = far_end.accept_one(&listener).expect("accepting");
+        for n in 0..SENDS {
+            let sent = session.next_send().expect("sent").expect("one");
+            assert_eq!(sent.bytes, n.to_string().as_bytes());
+        }
+        drop(session);
+        let mut again = far_end.accept_one(&listener).expect("a new client");
+        let last = again.next_send().expect("sent").expect("one");
+        assert_eq!(last.bytes, b"after the close");
+        sender.join().expect("thread").expect("sending");
+        assert_eq!(near.clients.opened(), 2);
     }
 
     #[test]

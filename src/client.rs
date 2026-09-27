@@ -6,18 +6,11 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 use net::authority::host_of;
-use transport::Arrived;
 use transport::error::{Result, classify, protocol_error};
-use transport::socket;
+use transport::pool::{Pooled, alive};
+use transport::{Arrived, Login, socket};
 
 use crate::frame::{Frame, encode, read};
-
-/// What a Location presents in CONNECT.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Login {
-    pub user: String,
-    pub password: String,
-}
 
 /// One MESSAGE as the broker delivered it: the Stream, and the id to
 /// acknowledge it by.
@@ -28,6 +21,8 @@ pub struct Message {
 }
 
 /// One connected client: sends, subscribes, takes what the broker sends.
+/// Kept between sends while the broker keeps it open: CONNECT asks for no
+/// heart-beat, so an idle client is not timed out for silence.
 pub struct Client {
     reader: BufReader<TcpStream>,
     writer: TcpStream,
@@ -209,6 +204,14 @@ impl Client {
         self.writer
             .flush()
             .map_err(|e| classify("flushing a frame", &e))
+    }
+}
+
+impl Pooled for Client {
+    /// While the broker has not closed the connection, and nothing it
+    /// delivered waits unread.
+    fn usable(&mut self) -> bool {
+        self.pending.is_empty() && alive(&self.writer)
     }
 }
 

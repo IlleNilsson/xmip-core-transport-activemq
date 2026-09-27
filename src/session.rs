@@ -12,11 +12,9 @@ use std::io::{BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;
 
-use transport::Arrived;
 use transport::error::{Result, classify, protocol_error};
-use transport::socket;
+use transport::{Arrived, Login, socket};
 
-use crate::client::Login;
 use crate::frame::{Frame, encode, read};
 
 /// What the client did, as [`Session::next_event`] reports it.
@@ -78,10 +76,7 @@ impl Session {
             return session.refuse("only STOMP 1.2 is spoken here");
         }
         let presented = match (connect.header("login"), connect.header("passcode")) {
-            (Some(user), Some(password)) => Some(Login {
-                user: user.to_string(),
-                password: password.to_string(),
-            }),
+            (Some(user), Some(password)) => Some(Login::new(user, password)),
             _ => None,
         };
         let admitted = expected.is_none_or(|expected| {
