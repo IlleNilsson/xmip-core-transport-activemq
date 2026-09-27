@@ -84,7 +84,16 @@ impl Session {
             }),
             _ => None,
         };
-        if expected.is_some() && presented.as_ref() != expected {
+        let admitted = expected.is_none_or(|expected| {
+            presented.as_ref().is_some_and(|given| {
+                given.user == expected.user
+                    && codec::constant_time::equal(
+                        given.password.as_bytes(),
+                        expected.password.as_bytes(),
+                    )
+            })
+        });
+        if !admitted {
             return session.refuse("not authorised");
         }
         session.connect = connect;
