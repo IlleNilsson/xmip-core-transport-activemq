@@ -10,10 +10,10 @@
 
 use std::io::BufRead;
 
+use net::MAX_BODY;
+use net::read;
+use transport::ceiling;
 use transport::error::{Result, classify, protocol_error};
-
-/// The most a frame body may say it is before it is refused.
-pub const MAX_BODY: usize = 64 * 1024 * 1024;
 
 /// One frame, either direction.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,7 +92,7 @@ pub fn encode(frame: &Frame) -> Vec<u8> {
 /// body over [`MAX_BODY`], or a body that does not end in NUL.
 pub fn read(reader: &mut impl BufRead) -> Result<Option<Frame>> {
     let command = loop {
-        let Some(line) = line(reader)? else {
+        let Some(line) = read::line(reader)? else {
             return Ok(None);
         };
         if !line.is_empty() {
@@ -101,8 +101,8 @@ pub fn read(reader: &mut impl BufRead) -> Result<Option<Frame>> {
     };
     let mut frame = Frame::new(&command);
     loop {
-        let line =
-            line(reader)?.ok_or_else(|| protocol_error("a frame that ends in its headers"))?;
+        let line = read::line(reader)?
+            .ok_or_else(|| protocol_error("a frame that ends in its headers"))?;
         if line.is_empty() {
             break;
         }
@@ -127,9 +127,7 @@ fn counted(reader: &mut impl BufRead, length: &str) -> Result<Vec<u8>> {
     let length: usize = length
         .parse()
         .map_err(|_| protocol_error(format!("a content-length that is not a number: {length}")))?;
-    if length > MAX_BODY {
-        return Err(protocol_error("a body over what Xmip will read"));
-    }
+    ceiling::within(length, MAX_BODY, "Xmip reads in one body")?;
     let mut body = vec![0u8; length + 1];
     reader
         .read_exact(&mut body)
@@ -143,33 +141,11 @@ fn counted(reader: &mut impl BufRead, length: &str) -> Result<Vec<u8>> {
 /// A body that runs to the first NUL.
 fn bare(reader: &mut impl BufRead) -> Result<Vec<u8>> {
     let mut body = Vec::new();
-    reader
-        .read_until(0, &mut body)
-        .map_err(|e| classify("reading a frame body", &e))?;
+    read::until(reader, 0, MAX_BODY + 1, &mut body)?;
     if body.pop() != Some(0) {
         return Err(protocol_error("a frame that ends before its NUL"));
     }
     Ok(body)
-}
-
-/// One line without its EOL, or `None` at the end of the connection.
-fn line(reader: &mut impl BufRead) -> Result<Option<String>> {
-    let mut raw = Vec::new();
-    let read = reader
-        .read_until(b'\n', &mut raw)
-        .map_err(|e| classify("reading a frame line", &e))?;
-    if read == 0 {
-        return Ok(None);
-    }
-    if raw.last() == Some(&b'\n') {
-        raw.pop();
-    }
-    if raw.last() == Some(&b'\r') {
-        raw.pop();
-    }
-    String::from_utf8(raw)
-        .map(Some)
-        .map_err(|_| protocol_error("a frame line that is not UTF-8"))
 }
 
 fn escape(text: &str) -> String {
