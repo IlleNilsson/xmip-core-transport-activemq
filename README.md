@@ -2,6 +2,8 @@
 
 ActiveMQ transport: STOMP 1.2 to ActiveMQ Classic and Artemis — connect, send with receipt, subscribe with client-individual acknowledgment — a queue or topic is a Location. A technology of [xmip-core-transport](https://github.com/IlleNilsson/xmip-core-transport).
 
+A Send Location sends on a client connected once per broker and kept (`transport::Pool`), each SEND receipted; the login is the transport capability's `Login`. Until 2026-09-27 every send connected and disconnected.
+
 ## Toolchain
 
 `rust-toolchain.toml` pins the toolchain for the whole estate. Do not change it
