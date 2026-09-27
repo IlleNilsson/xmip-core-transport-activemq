@@ -18,6 +18,9 @@ path = "src/lib.rs"
 # (repository-model.md). Standard library otherwise: STOMP is a command, a
 # few header lines and a body ended by NUL.
 transport = { package = "xmip-core-transport", git = "https://github.com/IlleNilsson/xmip-core-transport", branch = "main" }
+# The settings this technology declares (xcore::settings), read through
+# transport::Configured (ADR-0064, amendment 2026-09-26).
+xcore = { package = "xmip-core", git = "https://github.com/IlleNilsson/xmip-core", branch = "main" }
 # An authority read as a URI writes it: the host, and the default port.
 net = { package = "xmip-core-library-net", git = "https://github.com/IlleNilsson/xmip-core-library-net", branch = "main" }
 
@@ -36,3 +39,6 @@ missing_errors_doc = "warn"
 missing_panics_doc = "warn"
 unwrap_used = "warn"
 expect_used = "allow"
+
+[profile.dev.package."*"]
+opt-level = 3

@@ -36,7 +36,8 @@ use transport::error::{Result, protocol_error};
 use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
-use transport::{Arrived, Directions, Transport};
+use transport::{Arrived, Configured, Directions, Transport};
+use xcore::settings::{Applies, Kind, Presence, Read, Setting, Settings};
 
 #[derive(Clone)]
 pub struct ActiveMqTransport {
@@ -161,6 +162,41 @@ impl Transport for ActiveMqTransport {
     }
 }
 
+impl Configured for ActiveMqTransport {
+    /// The address is the broker's STOMP listener, `host:61613`. The login
+    /// is the Location's credentials, not a setting: a secret never is.
+    const SETTINGS: &'static Settings = &Settings {
+        technology: env!("CARGO_PKG_NAME"),
+        settings: &[
+            Setting {
+                name: "destination",
+                kind: Kind::Text,
+                presence: Presence::Required,
+                meaning: "The queue or topic as the broker names it, /queue/orders or \
+                          /topic/prices: subscribed to on receive, the default target on send.",
+                applies: Applies::Both,
+            },
+            Setting {
+                name: "timeout",
+                kind: Kind::Duration,
+                presence: Presence::Optional,
+                meaning: "How long a broker that stops mid-frame is waited on, and how long \
+                          a receive waits on a quiet destination; unbounded when left out.",
+                applies: Applies::Both,
+            },
+        ],
+    };
+
+    fn configured(address: &str, settings: &Read) -> Result<Self> {
+        // The login comes through the Location's credentials, not a setting.
+        let transport = Self::new(address, settings.text("destination"));
+        Ok(match settings.optional_duration("timeout") {
+            Some(timeout) => transport.timing_out_after(timeout),
+            None => transport,
+        })
+    }
+}
+
 impl ActiveMqTransport {
     /// Both ends on this machine: an ephemeral local port, the loopback
     /// timeout, one queue called `/queue/probe`.
@@ -203,9 +239,32 @@ impl Loopback for ActiveMqTransport {
 mod tests {
     use super::*;
     use transport::payload::{edge_payloads, sized_payloads};
+    use xcore::settings::Given;
 
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
+    }
+
+    #[test]
+    fn activemq_declares_its_settings_and_reads_through_them() {
+        assert_eq!(ActiveMqTransport::SETTINGS.problems(), Vec::<String>::new());
+        let given = [
+            (
+                "destination".to_string(),
+                Given::Text("/queue/orders".to_string()),
+            ),
+            ("timeout".to_string(), Given::Text("2s".to_string())),
+        ];
+        let transport =
+            ActiveMqTransport::open("broker:61613", Applies::Receive, &given).expect("built");
+        assert_eq!(transport.server, "broker:61613");
+        assert_eq!(transport.queue, "/queue/orders");
+        assert_eq!(transport.timeout, Some(secs(2)));
+        assert!(transport.login.is_none(), "the login is the credentials'");
+        let Err(refused) = ActiveMqTransport::open("broker:61613", Applies::Send, &[]) else {
+            panic!("destination is required");
+        };
+        assert!(refused.message.contains("\"destination\""), "{refused}");
     }
 
     #[test]
