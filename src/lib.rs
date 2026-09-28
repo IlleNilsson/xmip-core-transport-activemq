@@ -31,10 +31,12 @@ use std::time::Duration;
 
 pub use client::{Client, Message};
 pub use frame::Frame;
+use net::Target;
 pub use session::{Event, Queues, Session};
 use transport::error::{Result, protocol_error};
 use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
+use transport::pool::delivered;
 use transport::socket;
 use transport::{Arrived, Configured, Directions, Login, Pool, Transport};
 use xcore::settings::{Applies, Kind, Presence, Read, Setting, Settings};
@@ -47,6 +49,9 @@ pub struct ActiveMqTransport {
     timeout: Option<Duration>,
     /// The clients a send goes on, connected once per broker and kept.
     clients: Pool<Client>,
+    /// The client a receive takes from, connected and subscribed on the
+    /// first receive and kept subscribed.
+    subscriptions: Pool<Client>,
 }
 
 impl ActiveMqTransport {
@@ -60,12 +65,14 @@ impl ActiveMqTransport {
             login: None,
             timeout: None,
             clients: Pool::new(),
+            subscriptions: Pool::new(),
         }
     }
 
     /// CONNECT as this user.
     #[must_use]
-    pub fn with_login(mut self, user: &str, password: &str) -> Self {
+    #[cfg(test)]
+    fn with_login(mut self, user: &str, password: &str) -> Self {
         self.login = Some(Login::new(user, password));
         self
     }
@@ -108,17 +115,12 @@ impl ActiveMqTransport {
     /// `activemq://host:61613/queue/orders`, `host:61613/queue/orders` —
     /// or is a destination alone on this transport's broker.
     fn resolve(&self, target: &str) -> (String, String) {
-        if let Some((server, destination)) = socket::target("activemq", target) {
-            return match destination {
-                "" => (server.to_string(), self.queue.clone()),
-                _ => (server.to_string(), format!("/{destination}")),
-            };
-        }
-        match target.split_once('/') {
-            Some((server, destination)) if !server.is_empty() && server.contains(':') => {
-                (server.to_string(), format!("/{destination}"))
+        match Target::naming_server(&["activemq"], target) {
+            Some(named) if named.path().is_empty() && !named.scheme().is_empty() => {
+                (named.authority().to_string(), self.queue.clone())
             }
-            _ => (self.server.clone(), target.to_string()),
+            Some(named) => (named.authority().to_string(), format!("/{}", named.path())),
+            None => (self.server.clone(), target.to_string()),
         }
     }
 }
@@ -132,26 +134,29 @@ impl Transport for ActiveMqTransport {
         Directions::BOTH
     }
 
-    /// Subscribe to the queue and take what the broker delivers, each
-    /// acknowledged, until it has been quiet for the timeout or closes.
-    /// A quiet queue is an empty vector, not an error.
+    /// Take what the broker delivers, each acknowledged, until it has been
+    /// quiet for the timeout or closes, on the subscription the first
+    /// receive made and kept: what the broker delivered between two
+    /// receives waits in the socket. A quiet queue is an empty vector, not
+    /// an error.
     fn receive(&self) -> Result<Vec<Arrived>> {
-        let mut client = self.connect()?;
-        client.subscribe(&self.queue)?;
-        let mut arrived = Vec::new();
-        loop {
-            match client.next_message() {
-                Ok(Some(message)) => {
+        self.subscriptions.exchange(
+            self.server.as_str(),
+            || {
+                let mut client = self.connect()?;
+                client.subscribe(&self.queue)?;
+                Ok(client)
+            },
+            |client| {
+                delivered(client, |client| {
+                    let Some(message) = client.next_message()? else {
+                        return Ok(None);
+                    };
                     client.ack(&message.ack)?;
-                    arrived.push(message.arrived);
-                }
-                Ok(None) => return Ok(arrived),
-                Err(error) if error.retryable => break,
-                Err(error) => return Err(error),
-            }
-        }
-        client.disconnect()?;
-        Ok(arrived)
+                    Ok(Some(message.arrived))
+                })
+            },
+        )
     }
 
     /// SEND on the client kept for the broker, connected on the first send
@@ -329,6 +334,50 @@ mod tests {
                 .origin_uri
                 .ends_with("/queue/orders?message-id=2")
         );
+    }
+
+    #[test]
+    fn five_receives_subscribe_once_and_a_subscription_the_broker_closed_is_replaced() {
+        let far_end = ActiveMqTransport::new("127.0.0.1:0", "/queue/orders")
+            .with_login("xmip", "secret")
+            .timing_out_after(secs(5));
+        let (listener, address) = far_end.bind().expect("binding");
+        let near = ActiveMqTransport::new(address, "/queue/orders")
+            .with_login("xmip", "secret")
+            .timing_out_after(Duration::from_millis(100));
+        let receiving = near.clone();
+        let (taken, told) = std::sync::mpsc::channel();
+        let receiver = std::thread::spawn(move || {
+            let mut arrived = Vec::new();
+            while arrived.len() < 6 {
+                let now = receiving.receive()?;
+                if !now.is_empty() {
+                    taken.send(()).expect("told");
+                }
+                arrived.extend(now.into_iter().map(|one| one.bytes));
+            }
+            Ok::<_, transport::TransportError>(arrived)
+        });
+        let subscribed = |session: &mut Session| {
+            let event = session.next_event().expect("subscribed");
+            assert!(matches!(event, Some(Event::Subscribed { .. })), "{event:?}");
+        };
+        // One CONNECT and SUBSCRIBE for every receive: one session accepted.
+        let mut session = far_end.accept_one(&listener).expect("accepting");
+        subscribed(&mut session);
+        for round in 0..5u8 {
+            session
+                .deliver("/queue/orders", &[round])
+                .expect("delivered");
+            told.recv().expect("taken");
+        }
+        drop(session);
+        let mut again = far_end.accept_one(&listener).expect("a new client");
+        subscribed(&mut again);
+        again.deliver("/queue/orders", &[5]).expect("delivered");
+        let arrived = receiver.join().expect("thread").expect("receiving");
+        assert_eq!(arrived, (0..6u8).map(|n| vec![n]).collect::<Vec<_>>());
+        assert_eq!(near.subscriptions.opened(), 2);
     }
 
     #[test]

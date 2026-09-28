@@ -11,8 +11,8 @@
 use std::io::BufRead;
 
 use net::MAX_BODY;
+use net::ceiling;
 use net::read;
-use transport::ceiling;
 use transport::error::{Result, classify, protocol_error};
 
 /// One frame, either direction.
