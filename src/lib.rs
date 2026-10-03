@@ -7,7 +7,10 @@
 //! STOMP 1.2 is the protocol here: CONNECT and CONNECTED, SEND with a
 //! receipt so the broker has said it holds the message before the send is
 //! counted done, SUBSCRIBE with client-individual acknowledgement so each
-//! message is acknowledged once Xmip has it and never before. A queue or a
+//! message is answered after the runtime's receive cycle and never before:
+//! ACK when it accepted the message, NACK when it refused it, and nothing
+//! when the cycle failed, the subscription renewed so the broker delivers
+//! the message again. A queue or a
 //! topic is a Location: `/queue/orders`, `/topic/prices`. A Receive
 //! Location subscribes and takes what is delivered; a Send Location sends.
 //! Either may instead accept clients directly through [`Session`], one
@@ -38,7 +41,9 @@ use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::pool::delivered;
 use transport::socket;
-use transport::{Arrived, Configured, Directions, Login, Pool, Transport};
+use transport::{
+    Acknowledgement, Arrived, Configured, Directions, Login, Pool, Taken, Transport, Verdict,
+};
 use xcore::settings::{Applies, Kind, Presence, Read, Setting, Settings};
 
 #[derive(Clone)]
@@ -134,13 +139,23 @@ impl Transport for ActiveMqTransport {
         Directions::BOTH
     }
 
-    /// Take what the broker delivers, each acknowledged, until it has been
-    /// quiet for the timeout or closes, on the subscription the first
-    /// receive made and kept: what the broker delivered between two
-    /// receives waits in the socket. A quiet queue is an empty vector, not
-    /// an error.
+    fn arrivals(&self) -> transport::Arrivals {
+        transport::Arrivals::Ordered(
+            "the acknowledgement goes on the session the receive reads from",
+        )
+    }
+
+    /// Take what the broker delivers until it has been quiet for the
+    /// timeout or closes, on the subscription the first receive made and
+    /// kept: what the broker delivered between two receives waits in the
+    /// socket. A quiet queue is an empty vector, not an error. Nothing is
+    /// acknowledged here: each message's acknowledgement ([`answering`])
+    /// sends ACK on that subscription when the receive cycle accepted it,
+    /// NACK when it refused it, and nothing when the cycle failed: that
+    /// subscription is let go here, at the next receive, and a new one made,
+    /// so the broker delivers again what was left unanswered.
     fn receive(&self) -> Result<Vec<Arrived>> {
-        self.subscriptions.exchange(
+        let messages = self.subscriptions.exchange(
             self.server.as_str(),
             || {
                 let mut client = self.connect()?;
@@ -148,15 +163,23 @@ impl Transport for ActiveMqTransport {
                 Ok(client)
             },
             |client| {
-                delivered(client, |client| {
-                    let Some(message) = client.next_message()? else {
-                        return Ok(None);
-                    };
-                    client.ack(&message.ack)?;
-                    Ok(Some(message.arrived))
-                })
+                if client.withholds() {
+                    // Let go, so that the broker delivers again what was
+                    // left unanswered on it; a new subscription takes over.
+                    return Err(protocol_error(
+                        "a message was left for the broker to deliver again",
+                    ));
+                }
+                delivered(client, Client::next_message)
             },
-        )
+        )?;
+        Ok(messages
+            .into_iter()
+            .map(|message| {
+                let acknowledgement = answering(&self.subscriptions, &self.server, message.ack);
+                Arrived::whole(message.origin_uri, message.body, acknowledgement)
+            })
+            .collect())
     }
 
     /// SEND on the client kept for the broker, connected on the first send
@@ -169,6 +192,37 @@ impl Transport for ActiveMqTransport {
             |client| client.send(&destination, bytes),
         )
     }
+}
+
+/// The acknowledgement of the message delivered under `ack` on the
+/// subscription `subscriptions` keeps for `server`: ACK on
+/// [`Verdict::Accepted`]; NACK on [`Verdict::Refused`] — the client did not
+/// consume it, and the broker discards or dead-letters it rather than
+/// deliver it again (STOMP 1.2, *NACK*); on [`Verdict::Failed`] nothing is
+/// written, and the subscription is let go at the next receive, so the
+/// broker delivers it again ([`Client::withhold`]). One frame written at
+/// most, nothing waited for. An ack id names a message on one connection
+/// only, so the answer goes on the kept subscription or not at all: where
+/// the broker closed it meanwhile, no other is opened, and the broker
+/// delivers again what that connection had not answered.
+fn answering(subscriptions: &Pool<Client>, server: &str, ack: String) -> Acknowledgement {
+    let subscriptions = subscriptions.clone();
+    let server = server.to_string();
+    Acknowledgement::deferred(move |verdict| {
+        subscriptions.kept(
+            server.as_str(),
+            "the subscription that received the message is closed; \
+             the broker delivers it again",
+            |client| match verdict {
+                Verdict::Accepted => client.ack(&ack),
+                Verdict::Refused(_) => client.nack(&ack),
+                Verdict::Failed => {
+                    client.withhold();
+                    Ok(())
+                }
+            },
+        )
+    })
 }
 
 impl Configured for ActiveMqTransport {
@@ -216,7 +270,7 @@ impl ActiveMqTransport {
 }
 
 impl Accepting for ActiveMqTransport {
-    fn take_one(self, listener: &TcpListener) -> Result<Arrived> {
+    fn take_one(self, listener: &TcpListener) -> Result<Taken> {
         let mut session = self.accept_one(listener)?;
         // The receipt goes out before the send is reported; the client keeps
         // its connection for the next.
@@ -245,6 +299,7 @@ impl Loopback for ActiveMqTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use transport::arrived::next_arrival;
     use transport::payload::{edge_payloads, sized_payloads};
     use xcore::settings::Given;
 
@@ -275,7 +330,7 @@ mod tests {
     }
 
     #[test]
-    fn a_client_sends_to_a_session_and_the_session_delivers_to_a_receiver() {
+    fn a_receiver_acks_the_accepted_nacks_the_refused_and_leaves_the_failed_to_come_again() {
         let far_end = ActiveMqTransport::new("127.0.0.1:0", "/queue/orders")
             .with_login("xmip", "secret")
             .timing_out_after(secs(2));
@@ -287,21 +342,30 @@ mod tests {
             near.send("/queue/orders", b"order 1\r\nline 2")?;
             near.send(&format!("activemq://{address}/queue/orders"), b"")?;
             near.send(&format!("{address}/queue/other"), b"other")?;
-            ActiveMqTransport::new(address, "/queue/orders")
+            near.send("/queue/orders", b"order 3")?;
+            let receiving = ActiveMqTransport::new(address, "/queue/orders")
                 .with_login("xmip", "secret")
-                .timing_out_after(Duration::from_millis(300))
-                .receive()
+                .timing_out_after(Duration::from_millis(300));
+            let mut arrived = receiving.receive()?.into_iter();
+            let one = arrived.next().expect("one").taken()?;
+            let two = arrived.next().expect("two");
+            let origin = two.origin_uri.clone();
+            two.refused(transport::Refusal::Unacceptable)?;
+            arrived.next().expect("three").failed()?;
+            // The failed one comes again, on a new subscription.
+            let again = next_arrival(receiving.receive()?, "three again")?.taken()?;
+            Ok::<_, transport::TransportError>((one, origin, again))
         });
-        // One broker, so one client for all three sends: connected once.
+        // One broker, so one client for all four sends: connected once.
         let mut session = far_end.accept_one(&listener).expect("accepting");
         assert_eq!(session.connect().header("login"), Some("xmip"));
-        for expected in [&b"order 1\r\nline 2"[..], b"", b"other"] {
+        for expected in [&b"order 1\r\nline 2"[..], b"", b"other", b"order 3"] {
             let sent = session.next_send().expect("sent").expect("one");
             assert_eq!(sent.bytes, expected);
             assert!(sent.origin_uri.starts_with("activemq://127.0.0.1:"));
         }
         let queues = session.into_queues();
-        assert_eq!(queues["/queue/orders"].len(), 2);
+        assert_eq!(queues["/queue/orders"].len(), 3);
         assert_eq!(queues["/queue/other"].len(), 1);
         let mut session = far_end
             .accept_one(&listener)
@@ -313,27 +377,35 @@ mod tests {
         }
         assert!(matches!(&events[0], Event::Subscribed { destination, .. }
             if destination == "/queue/orders"));
+        // Accepted, ACK; refused, NACK, not delivered again; failed,
+        // nothing, and the connection let go.
         assert_eq!(events[1], Event::Acked("1".to_string()));
-        assert_eq!(events[2], Event::Acked("2".to_string()));
+        assert_eq!(events[2], Event::Nacked("2".to_string()));
         assert_eq!(events.len(), 3);
         assert!(
             session.queues()["/queue/other"].len() == 1,
             "not subscribed"
         );
-        let arrived = sender.join().expect("thread").expect("receiving");
-        assert_eq!(arrived.len(), 2);
-        assert_eq!(arrived[0].bytes, b"order 1\r\nline 2");
-        assert!(
-            arrived[0]
-                .origin_uri
-                .ends_with("/queue/orders?message-id=1")
+        let queues = session.into_queues();
+        assert_eq!(
+            queues["/queue/orders"],
+            [b"order 3".to_vec()],
+            "the unanswered one is the broker's again"
         );
-        assert!(arrived[1].bytes.is_empty());
-        assert!(
-            arrived[1]
-                .origin_uri
-                .ends_with("/queue/orders?message-id=2")
-        );
+        let mut session = far_end
+            .accept_one(&listener)
+            .expect("a new subscription")
+            .with_queues(queues);
+        let mut events = Vec::new();
+        while let Some(event) = session.next_event().expect("serving") {
+            events.push(event);
+        }
+        assert_eq!(events[1..], [Event::Acked("1".to_string())]);
+        let (one, two, again) = sender.join().expect("thread").expect("receiving");
+        assert_eq!(again.bytes, b"order 3");
+        assert_eq!(one.bytes, b"order 1\r\nline 2");
+        assert!(one.origin_uri.ends_with("/queue/orders?message-id=1"));
+        assert!(two.ends_with("/queue/orders?message-id=2"));
     }
 
     #[test]
@@ -354,7 +426,9 @@ mod tests {
                 if !now.is_empty() {
                     taken.send(()).expect("told");
                 }
-                arrived.extend(now.into_iter().map(|one| one.bytes));
+                for one in now {
+                    arrived.push(one.taken()?.bytes);
+                }
             }
             Ok::<_, transport::TransportError>(arrived)
         });
@@ -438,7 +512,7 @@ mod tests {
         );
         drop(session);
         let (first, second) = receiver.join().expect("thread").expect("listening");
-        assert_eq!(first.arrived.bytes, b"42");
+        assert_eq!(first.body, b"42");
         assert_eq!(first.ack, "1");
         assert!(second.is_none(), "the broker closed");
     }

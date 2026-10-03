@@ -8,15 +8,16 @@ use std::time::Duration;
 use net::authority::host_of;
 use transport::error::{Result, classify, protocol_error};
 use transport::pool::{Pooled, alive};
-use transport::{Arrived, Login, socket};
+use transport::{Login, socket};
 
 use crate::frame::{Frame, encode, read};
 
-/// One MESSAGE as the broker delivered it: the Stream, and the id to
-/// acknowledge it by.
+/// One MESSAGE as the broker delivered it: where it came from, its body,
+/// and the id to ACK or NACK it by.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
-    pub arrived: Arrived,
+    pub origin_uri: String,
+    pub body: Vec<u8>,
     pub ack: String,
 }
 
@@ -30,6 +31,9 @@ pub struct Client {
     session: String,
     next_id: u64,
     pending: VecDeque<Frame>,
+    /// A message on this subscription was left unanswered for the broker
+    /// to deliver again ([`Client::withhold`]).
+    withheld: bool,
 }
 
 impl Client {
@@ -48,6 +52,7 @@ impl Client {
             session: String::new(),
             next_id: 0,
             pending: VecDeque::new(),
+            withheld: false,
         };
         let mut connect = Frame::new("CONNECT")
             .with_header("accept-version", "1.2")
@@ -143,6 +148,35 @@ impl Client {
         self.write(&Frame::new("ACK").with_header("id", ack))
     }
 
+    /// NACK the message delivered under `ack`: the client did not consume
+    /// it, and the broker discards it or puts it in a dead letter queue as
+    /// its policy says (STOMP 1.2, *NACK*) — `ActiveMQ` Classic dead-letters
+    /// it at once.
+    ///
+    /// # Errors
+    /// Where the broker went away.
+    pub fn nack(&mut self, ack: &str) -> Result<()> {
+        self.write(&Frame::new("NACK").with_header("id", ack))
+    }
+
+    /// Leave a message delivered on this subscription unanswered, for the
+    /// broker to deliver again. STOMP 1.2 has no frame that asks for that:
+    /// with `client-individual` acknowledgement a message is the broker's
+    /// again once the connection it was delivered on ends (STOMP 1.2,
+    /// *SUBSCRIBE*, the `ack` header). So the client is marked, answers
+    /// later messages of the same receive cycle as they are given, and the
+    /// next receive lets it go and subscribes anew ([`Client::withholds`]).
+    pub const fn withhold(&mut self) {
+        self.withheld = true;
+    }
+
+    /// Whether a message on this subscription was left for the broker to
+    /// deliver again, so the connection must end before it is.
+    #[must_use]
+    pub const fn withholds(&self) -> bool {
+        self.withheld
+    }
+
     /// DISCONNECT with a receipt, and wait for it.
     ///
     /// # Errors
@@ -163,13 +197,11 @@ impl Client {
             "/"
         };
         Message {
-            arrived: Arrived::new(
-                format!(
-                    "activemq://{}{slash}{destination}?message-id={id}",
-                    self.server
-                ),
-                frame.body.clone(),
+            origin_uri: format!(
+                "activemq://{}{slash}{destination}?message-id={id}",
+                self.server
             ),
+            body: frame.body.clone(),
             ack,
         }
     }
