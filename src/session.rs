@@ -13,21 +13,24 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;
 
 use transport::error::{Result, classify, protocol_error};
-use transport::{Arrived, Login, socket};
+use transport::{Login, Taken, socket};
 
 use crate::frame::{Frame, encode, read};
 
 /// What the client did, as [`Session::next_event`] reports it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
-    /// The client sent to a destination; here is the Stream.
-    Sent(Arrived),
+    /// The client sent to a destination; here is what it sent.
+    Sent(Taken),
     /// The client subscribed to `destination` under `id`.
     Subscribed { id: String, destination: String },
     /// The client unsubscribed `id`.
     Unsubscribed(String),
     /// The client acknowledged this message.
     Acked(String),
+    /// The client did not consume this message: the broker discards it or
+    /// dead-letters it, and does not deliver it again.
+    Nacked(String),
 }
 
 /// What the session holds: messages per destination, not yet delivered.
@@ -40,6 +43,10 @@ pub struct Session {
     connect: Frame,
     queues: Queues,
     subscriptions: Vec<(String, String)>,
+    /// What was delivered and not yet answered — its ack id, destination
+    /// and body, in delivery order: put back on its queue when the
+    /// connection ends, as a broker does.
+    unanswered: Vec<(String, String, Vec<u8>)>,
     next_message: u64,
 }
 
@@ -65,6 +72,7 @@ impl Session {
             connect: Frame::new("CONNECT"),
             queues: Queues::new(),
             subscriptions: Vec::new(),
+            unanswered: Vec::new(),
             next_message: 0,
         };
         let connect = match read(&mut session.reader)? {
@@ -126,9 +134,14 @@ impl Session {
         &self.queues
     }
 
-    /// The queues, for the next session to carry on with.
+    /// The queues, for the next session to carry on with: what this
+    /// connection delivered and the client left unanswered is put back on
+    /// its queue, to be delivered again.
     #[must_use]
-    pub fn into_queues(self) -> Queues {
+    pub fn into_queues(mut self) -> Queues {
+        for (_, destination, body) in std::mem::take(&mut self.unanswered) {
+            self.queues.entry(destination).or_default().push(body);
+        }
         self.queues
     }
 
@@ -136,7 +149,7 @@ impl Session {
     ///
     /// # Errors
     /// Where the connection broke, or nothing arrived before the timeout.
-    pub fn next_send(&mut self) -> Result<Option<Arrived>> {
+    pub fn next_send(&mut self) -> Result<Option<Taken>> {
         loop {
             match self.next_event()? {
                 Some(Event::Sent(arrived)) => return Ok(Some(arrived)),
@@ -167,7 +180,7 @@ impl Session {
                         "/"
                     };
                     let origin = format!("activemq://{}{slash}{destination}", self.peer);
-                    Event::Sent(Arrived::new(origin, frame.body.clone()))
+                    Event::Sent(Taken::new(origin, frame.body.clone()))
                 }
                 "SUBSCRIBE" => {
                     let id = frame.header("id").unwrap_or_default().to_string();
@@ -187,8 +200,13 @@ impl Session {
                 }
                 "ACK" | "NACK" => {
                     let id = frame.header("id").unwrap_or_default().to_string();
+                    self.unanswered.retain(|(unanswered, ..)| *unanswered != id);
                     self.receipt(&frame)?;
-                    Event::Acked(id)
+                    if frame.command == "ACK" {
+                        Event::Acked(id)
+                    } else {
+                        Event::Nacked(id)
+                    }
                 }
                 "DISCONNECT" => {
                     self.receipt(&frame)?;
@@ -227,6 +245,8 @@ impl Session {
         };
         self.next_message += 1;
         let message_id = self.next_message.to_string();
+        self.unanswered
+            .push((message_id.clone(), destination.to_string(), body.to_vec()));
         self.write(
             &Frame::new("MESSAGE")
                 .with_header("subscription", &id)
