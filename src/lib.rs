@@ -185,11 +185,24 @@ impl Transport for ActiveMqTransport {
     /// SEND on the client kept for the broker, connected on the first send
     /// to it, and wait for the receipt.
     fn send(&self, target: &str, bytes: &[u8]) -> Result<()> {
+        self.send_under(target, bytes, None)
+    }
+
+    /// The key goes in the `_AMQ_DUPL_ID` header ([`client::DUPLICATE_ID`]):
+    /// Artemis drops a SEND whose duplicate id it already holds.
+    fn send_keyed(&self, target: &str, bytes: &[u8], key: &str) -> Result<()> {
+        self.send_under(target, bytes, Some(key))
+    }
+}
+
+impl ActiveMqTransport {
+    /// The one send, on the client kept for the target's broker.
+    fn send_under(&self, target: &str, bytes: &[u8], key: Option<&str>) -> Result<()> {
         let (server, destination) = self.resolve(target);
         self.clients.exchange(
             &server,
             || Client::connect(&server, self.login.as_ref(), self.timeout),
-            |client| client.send(&destination, bytes),
+            |client| client.send(&destination, bytes, key),
         )
     }
 }

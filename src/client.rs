@@ -12,6 +12,12 @@ use transport::{Login, socket};
 
 use crate::frame::{Frame, encode, read};
 
+/// The header a keyed SEND carries its deduplication key in: Artemis's
+/// duplicate detection property, which the broker takes a STOMP header as
+/// and by which it drops a message it already holds; `ActiveMQ` Classic
+/// hands it to its consumer as a message property.
+pub const DUPLICATE_ID: &str = "_AMQ_DUPL_ID";
+
 /// One MESSAGE as the broker delivered it: where it came from, its body,
 /// and the id to ACK or NACK it by.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -86,18 +92,22 @@ impl Client {
         &self.session
     }
 
-    /// SEND `bytes` to `destination` and wait for the RECEIPT that says
-    /// the broker has it.
+    /// SEND `bytes` to `destination`, under `key` as its
+    /// [`DUPLICATE_ID`] where there is one, and wait for the RECEIPT that
+    /// says the broker has it.
     ///
     /// # Errors
     /// Where the broker went away or answered with ERROR.
-    pub fn send(&mut self, destination: &str, bytes: &[u8]) -> Result<()> {
+    pub fn send(&mut self, destination: &str, bytes: &[u8], key: Option<&str>) -> Result<()> {
         let receipt = self.next_id();
-        let frame = Frame::new("SEND")
+        let mut frame = Frame::new("SEND")
             .with_header("destination", destination)
             .with_header("receipt", &receipt)
-            .with_header("content-type", "application/octet-stream")
-            .with_body(bytes);
+            .with_header("content-type", "application/octet-stream");
+        if let Some(key) = key {
+            frame = frame.with_header(DUPLICATE_ID, key);
+        }
+        let frame = frame.with_body(bytes);
         self.write(&frame)?;
         self.await_receipt(&receipt)
     }
