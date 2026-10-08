@@ -42,7 +42,8 @@ use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::pool::delivered;
 use transport::socket;
 use transport::{
-    Acknowledgement, Arrived, Configured, Directions, Login, Pool, Taken, Transport, Verdict,
+    Acknowledgement, ArrivalIdentity, Arrived, Configured, Directions, Headers, Login, Pool, Taken,
+    Transport, Verdict,
 };
 use xcore::settings::{Applies, Kind, Presence, Read, Setting, Settings};
 
@@ -178,6 +179,8 @@ impl Transport for ActiveMqTransport {
             .map(|message| {
                 let acknowledgement = answering(&self.subscriptions, &self.server, message.ack);
                 Arrived::whole(message.origin_uri, message.body, acknowledgement)
+                    .detected()
+                    .with_headers(Headers::of("stomp").text(message.headers))
             })
             .collect())
     }
@@ -294,6 +297,12 @@ impl Accepting for ActiveMqTransport {
 }
 
 impl Loopback for ActiveMqTransport {
+    fn arrival_identity(&self) -> ArrivalIdentity {
+        ArrivalIdentity::Unnamed(
+            "the broker delivers it: its headers say who sent it, the peer is the broker",
+        )
+    }
+
     fn far_end(&self) -> Result<Box<dyn FarEnd>> {
         Ok(Box::new(Listening::new(self.clone(), self.bind()?)))
     }

@@ -25,6 +25,9 @@ pub struct Message {
     pub origin_uri: String,
     pub body: Vec<u8>,
     pub ack: String,
+    /// The frame's headers as the broker delivered them: who sent it is
+    /// said there, where the producer or the broker says it.
+    pub headers: Vec<(String, String)>,
 }
 
 /// One connected client: sends, subscribes, takes what the broker sends.
@@ -213,6 +216,7 @@ impl Client {
             ),
             body: frame.body.clone(),
             ack,
+            headers: frame.headers.clone(),
         }
     }
 
