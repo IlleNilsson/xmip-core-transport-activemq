@@ -146,6 +146,10 @@ impl Transport for ActiveMqTransport {
         )
     }
 
+    fn waiting(&self) -> transport::Waiting {
+        transport::Waiting::Waits("the broker is drained until quiet for the timeout")
+    }
+
     /// Take what the broker delivers until it has been quiet for the
     /// timeout or closes, on the subscription the first receive made and
     /// kept: what the broker delivered between two receives waits in the
