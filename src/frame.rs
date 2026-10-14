@@ -212,7 +212,7 @@ mod tests {
         let connect = Frame::new("CONNECT").with_header("host", "a:b");
         assert!(encode(&connect).starts_with(b"CONNECT\nhost:a:b\n\n"));
         assert_eq!(round_trip(&connect).header("host"), Some("a:b"));
-        assert!(round_trip(&Frame::new("DISCONNECT")).body.is_empty());
+        assert_eq!(round_trip(&Frame::new("DISCONNECT")).body, [] as [u8; 0]);
     }
 
     #[test]
