@@ -544,6 +544,32 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_login_is_answered_error_over_what_the_client_sent_after() {
+        // A SEND without a receipt does not wait. The ERROR is written with
+        // megabytes the client sent after its CONNECT unread, which a bare
+        // drop resets away on Windows.
+        let far_end = ActiveMqTransport::new("127.0.0.1:0", "/queue/x")
+            .with_login("xmip", "secret")
+            .timing_out_after(secs(2));
+        let (listener, address) = far_end.bind().expect("binding");
+        let serving = std::thread::spawn(move || far_end.accept_one(&listener).err());
+        let connect = frame::Frame::new("CONNECT")
+            .with_header("accept-version", "1.2")
+            .with_header("login", "xmip")
+            .with_header("passcode", "wrong");
+        let mut head = frame::encode(&connect);
+        head.extend_from_slice(b"SEND\ndestination:/queue/x\n\n");
+        let answer = transport::unread::answered_over_unread(&address, &head, b'x', |stream| {
+            frame::read(&mut std::io::BufReader::new(stream))
+        });
+        let answer = answer.expect("the ERROR").expect("a frame");
+        assert_eq!(answer.command, "ERROR");
+        assert_eq!(answer.header("message"), Some("not authorised"));
+        let refused = serving.join().expect("the far end").expect("refused");
+        assert!(refused.message.contains("not authorised"), "{refused}");
+    }
+
+    #[test]
     fn a_refused_login_and_a_broker_that_is_not_stomp_are_permanent() {
         let far_end = ActiveMqTransport::new("127.0.0.1:0", "/queue/x")
             .with_login("xmip", "secret")
