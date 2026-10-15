@@ -111,7 +111,7 @@ impl Session {
     }
 
     fn refuse(mut self, message: &str) -> Result<Self> {
-        self.write(&Frame::new("ERROR").with_header("message", message))?;
+        self.error(message)?;
         Err(protocol_error(format!("the client was refused: {message}")))
     }
 
@@ -217,7 +217,7 @@ impl Session {
                     continue;
                 }
                 other => {
-                    self.write(&Frame::new("ERROR").with_header("message", "unknown command"))?;
+                    self.error("unknown command")?;
                     return Err(protocol_error(format!("{other} from a client")));
                 }
             };
@@ -264,6 +264,15 @@ impl Session {
             Some(receipt) => self.write(&Frame::new("RECEIPT").with_header("receipt-id", receipt)),
             None => Ok(()),
         }
+    }
+
+    /// ERROR with `message`, and the connection ended through
+    /// `socket::finish`: STOMP closes after an ERROR, and a client that
+    /// sent frames after the one refused — a SEND without a receipt does
+    /// not wait — would otherwise have the ERROR reset away.
+    fn error(&mut self, message: &str) -> Result<()> {
+        self.write(&Frame::new("ERROR").with_header("message", message))?;
+        socket::finish(&self.writer)
     }
 
     fn write(&mut self, frame: &Frame) -> Result<()> {
