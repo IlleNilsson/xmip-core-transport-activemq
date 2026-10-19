@@ -159,7 +159,7 @@ impl Transport for ActiveMqTransport {
     /// NACK when it refused it, and nothing when the cycle failed: that
     /// subscription is let go here, at the next receive, and a new one made,
     /// so the broker delivers again what was left unanswered.
-    fn receive(&self) -> Result<Vec<Arrived>> {
+    fn receive_up_to(&self, most: usize) -> Result<Vec<Arrived>> {
         let messages = self.subscriptions.exchange(
             self.server.as_str(),
             || {
@@ -175,7 +175,7 @@ impl Transport for ActiveMqTransport {
                         "a message was left for the broker to deliver again",
                     ));
                 }
-                delivered(client, Client::next_message)
+                delivered(client, most, Client::next_message)
             },
         )?;
         Ok(messages
@@ -189,16 +189,17 @@ impl Transport for ActiveMqTransport {
             .collect())
     }
 
-    /// SEND on the client kept for the broker, connected on the first send
-    /// to it, and wait for the receipt.
-    fn send(&self, target: &str, bytes: &[u8]) -> Result<()> {
-        self.send_under(target, bytes, None)
+    fn sending(&self) -> transport::Sending {
+        transport::Sending::Gathered("a STOMP SEND is one frame the broker takes whole")
     }
 
+    /// SEND on the client kept for the broker, connected on the first send
+    /// to it, and wait for the receipt.
     /// The key goes in the `_AMQ_DUPL_ID` header ([`client::DUPLICATE_ID`]):
     /// Artemis drops a SEND whose duplicate id it already holds.
-    fn send_keyed(&self, target: &str, bytes: &[u8], key: &str) -> Result<()> {
-        self.send_under(target, bytes, Some(key))
+    fn send_from(&self, target: &str, outgoing: transport::Outgoing<'_>) -> Result<()> {
+        let bytes: &[u8] = &outgoing.gather()?;
+        self.send_under(target, bytes, outgoing.key())
     }
 }
 

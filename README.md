@@ -12,7 +12,7 @@ A send target is read by `net::Target` in [xmip-core-library-net](https://github
 
 ## The deduplication key
 
-A keyed send (`Transport::send_keyed`, built 2026-10-04) carries the Journey's identifier in the SEND frame's `_AMQ_DUPL_ID` header (`client::DUPLICATE_ID`), the same on every attempt of one Journey. Artemis takes a STOMP header as a message property, and this one is its duplicate detection id: a SEND whose id the address already holds within its cache is dropped. `ActiveMQ` Classic has no such detection over STOMP and hands the header to its consumer as a property, which recognises the repeat by it. An unkeyed `send` carries none.
+A keyed send (the key `Transport::send_from` is handed, `Outgoing::key`; built 2026-10-04) carries the Journey's identifier in the SEND frame's `_AMQ_DUPL_ID` header (`client::DUPLICATE_ID`), the same on every attempt of one Journey. Artemis takes a STOMP header as a message property, and this one is its duplicate detection id: a SEND whose id the address already holds within its cache is dropped. `ActiveMQ` Classic has no such detection over STOMP and hands the header to its consumer as a property, which recognises the repeat by it. An unkeyed `send` carries none.
 
 ## Toolchain
 

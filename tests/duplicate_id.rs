@@ -25,8 +25,8 @@ fn a_keyed_send_carries_the_journey_id_as_its_duplicate_id_on_every_attempt() {
     let sender = thread::spawn(move || {
         let near = ActiveMqTransport::loopback();
         let target = format!("activemq://{address}/queue/probe");
-        near.send_keyed(&target, b"order", KEY)?;
-        near.send_keyed(&target, b"order", KEY)?;
+        near.send_from(&target, transport::Outgoing::held(b"order").keyed(KEY))?;
+        near.send_from(&target, transport::Outgoing::held(b"order").keyed(KEY))?;
         near.send(&target, b"order")
     });
     let (stream, _) = socket::accept_tcp(&listener, Some(LOOPBACK_TIMEOUT)).expect("accepted");
