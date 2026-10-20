@@ -565,9 +565,9 @@ mod tests {
         });
         let answer = answer.expect("the ERROR").expect("a frame");
         assert_eq!(answer.command, "ERROR");
-        assert_eq!(answer.header("message"), Some("not authorised"));
+        assert_eq!(answer.header("message"), Some("not authorized"));
         let refused = serving.join().expect("the far end").expect("refused");
-        assert!(refused.message.contains("not authorised"), "{refused}");
+        assert!(refused.message.contains("not authorized"), "{refused}");
     }
 
     #[test]
@@ -590,7 +590,7 @@ mod tests {
         );
         let error = stranger.join().expect("thread");
         assert!(!error.retryable, "{error}");
-        assert!(error.message.contains("not authorised"));
+        assert!(error.message.contains("not authorized"));
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let address = listener.local_addr().expect("address").to_string();
