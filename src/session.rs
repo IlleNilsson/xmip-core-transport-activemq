@@ -97,7 +97,7 @@ impl Session {
             })
         });
         if !admitted {
-            return session.refuse("not authorised");
+            return session.refuse("not authorized");
         }
         session.connect = connect;
         session.write(
