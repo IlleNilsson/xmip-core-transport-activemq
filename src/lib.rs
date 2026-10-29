@@ -121,7 +121,7 @@ impl ActiveMqTransport {
     /// `activemq://host:61613/queue/orders`, `host:61613/queue/orders` —
     /// or is a destination alone on this transport's broker.
     fn resolve(&self, target: &str) -> (String, String) {
-        match Target::naming_server(&["activemq"], target) {
+        match Target::naming_server(Self::SCHEMES, target) {
             Some(named) if named.path().is_empty() && !named.scheme().is_empty() => {
                 (named.authority().to_string(), self.queue.clone())
             }
@@ -270,6 +270,9 @@ impl Configured for ActiveMqTransport {
             },
         ],
     };
+
+    /// The schemes a Location's address is entered with to choose this technology.
+    const SCHEMES: &'static [&'static str] = &["activemq"];
 
     fn configured(address: &str, settings: &Read) -> Result<Self> {
         // The login comes through the Location's credentials, not a setting.
