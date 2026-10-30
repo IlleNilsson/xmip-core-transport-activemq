@@ -1,6 +1,6 @@
 //! A keyed send carries its deduplication key in the `_AMQ_DUPL_ID`
 //! header, the property Artemis detects duplicates by, the same on every
-//! attempt of one Journey; an unkeyed send carries none.
+//! attempt on one Journey; an unkeyed send carries none.
 //!
 //! The far end is the broker's side read frame by frame, through the
 //! crate's own codec: the in-process `Session` reports what was sent, not
