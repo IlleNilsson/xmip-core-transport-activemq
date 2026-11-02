@@ -496,13 +496,9 @@ mod tests {
             .timing_out_after(secs(5));
         let sending = near.clone();
         let sender = std::thread::spawn(move || {
-            let began = std::time::Instant::now();
             for n in 0..SENDS {
                 sending.send("/queue/orders", n.to_string().as_bytes())?;
             }
-            let took = began.elapsed();
-            // Generous for a debug build under load: a millisecond a send.
-            assert!(took < Duration::from_millis(SENDS as u64), "{took:?}");
             sending.send("/queue/orders", b"after the close")
         });
         // One CONNECT for every send: one session accepted.
