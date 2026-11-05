@@ -1,5 +1,5 @@
 //! The broker's side of one connection: what a test puts at the far end,
-//! and what the playground stands up in place of a broker.
+//! and what the essentials stands up in place of a broker.
 //!
 //! Not a broker. One session serves one client and keeps its queues in
 //! memory: what is sent is stored per destination, or delivered at once
