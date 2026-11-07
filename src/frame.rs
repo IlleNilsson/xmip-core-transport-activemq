@@ -202,7 +202,7 @@ mod tests {
             .with_header("odd", "a:b\\c\nd\re")
             .with_body(b"one\0two");
         let bytes = encode(&send);
-        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let text = String::from_utf8_lossy(&bytes);
         assert!(text.starts_with("SEND\ndestination:/queue/orders\nodd:a\\cb\\\\c\\nd\\re\n"));
         assert!(text.contains("content-length:7\n\n"));
         assert!(bytes.ends_with(b"one\0two\0"));
