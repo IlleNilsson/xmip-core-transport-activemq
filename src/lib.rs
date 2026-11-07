@@ -329,6 +329,7 @@ impl Loopback for ActiveMqTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
     use transport::arrived::next_arrival;
     use transport::payload::{edge_payloads, sized_payloads};
     use xcore::settings::Given;
@@ -405,8 +406,10 @@ mod tests {
         while let Some(event) = session.next_event().expect("serving") {
             events.push(event);
         }
-        assert!(matches!(&events[0], Event::Subscribed { destination, .. }
-            if destination == "/queue/orders"));
+        assert_matches!(
+            &events[0],
+            Event::Subscribed { destination, .. } if destination == "/queue/orders"
+        );
         // Accepted, ACK; refused, NACK, not delivered again; failed,
         // nothing, and the connection let go.
         assert_eq!(events[1], Event::Acked("1".to_string()));
@@ -464,7 +467,7 @@ mod tests {
         });
         let subscribed = |session: &mut Session| {
             let event = session.next_event().expect("subscribed");
-            assert!(matches!(event, Some(Event::Subscribed { .. })), "{event:?}");
+            assert_matches!(event, Some(Event::Subscribed { .. }), "{event:?}");
         };
         // One CONNECT and SUBSCRIBE for every receive: one session accepted.
         let mut session = far_end.accept_one(&listener).expect("accepting");
