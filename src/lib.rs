@@ -119,8 +119,12 @@ impl ActiveMqTransport {
 
     /// Where a target names the broker and destination itself —
     /// `activemq://host:61613/queue/orders`, `host:61613/queue/orders` —
-    /// or is a destination alone on this transport's broker.
+    /// or is a destination alone on this transport's broker, or empty and
+    /// this transport's destination (`transport::destination::named`).
     fn resolve(&self, target: &str) -> (String, String) {
+        let Some(target) = transport::destination::named(target) else {
+            return (self.server.clone(), self.queue.clone());
+        };
         match Target::naming_server(Self::SCHEMES, target) {
             Some(named) if named.path().is_empty() && !named.scheme().is_empty() => {
                 (named.authority().to_string(), self.queue.clone())
@@ -274,6 +278,11 @@ impl Configured for ActiveMqTransport {
     /// The schemes a Location's address is entered with to choose this technology.
     const SCHEMES: &'static [&'static str] = &["activemq"];
 
+    /// The destination setting: the address names only the broker.
+    fn own_target(_address: &str) -> &str {
+        transport::destination::OWN
+    }
+
     fn configured(address: &str, settings: &Read) -> Result<Self> {
         // The login comes through the Location's credentials, not a setting.
         let transport = Self::new(address, settings.text("destination"));
@@ -358,6 +367,42 @@ mod tests {
             panic!("destination is required");
         };
         assert!(refused.message.contains("\"destination\""), "{refused}");
+    }
+
+    #[test]
+    fn a_send_location_sends_to_its_destination_and_a_target_naming_another_wins() {
+        let far_end =
+            ActiveMqTransport::new("127.0.0.1:0", "/queue/probe").timing_out_after(secs(2));
+        let (listener, address) = far_end.bind().expect("binding");
+        let location = format!("activemq://{address}");
+        let sender = std::thread::spawn(move || {
+            let given = [
+                (
+                    "destination".to_string(),
+                    Given::Text("/queue/orders".to_string()),
+                ),
+                ("timeout".to_string(), Given::Text("2s".to_string())),
+            ];
+            let near = ActiveMqTransport::open(&location, Applies::Send, &given)?;
+            near.send(ActiveMqTransport::own_target(&location), b"own")?;
+            near.send("/queue/invoices", b"other")
+        });
+        let mut session = far_end.accept_one(&listener).expect("accepting");
+        for sent in ["own", "other"] {
+            session.next_send().expect(sent).expect(sent);
+        }
+        sender.join().expect("thread").expect("sending");
+        let queues = session.into_queues();
+        assert_eq!(
+            queues.get("/queue/orders").map(Vec::len),
+            Some(1),
+            "{queues:?}"
+        );
+        assert_eq!(
+            queues.get("/queue/invoices").map(Vec::len),
+            Some(1),
+            "{queues:?}"
+        );
     }
 
     #[test]
@@ -628,6 +673,10 @@ mod tests {
         assert_eq!(
             transport.resolve("activemq://h:1"),
             ("h:1".to_string(), "/queue/x".to_string())
+        );
+        assert_eq!(
+            transport.resolve(""),
+            ("127.0.0.1:0".to_string(), "/queue/x".to_string())
         );
     }
 
