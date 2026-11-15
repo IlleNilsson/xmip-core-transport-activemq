@@ -83,14 +83,6 @@ impl ActiveMqTransport {
         self
     }
 
-    /// Give up on a broker that stops mid-frame, and stop receiving when
-    /// it has been quiet this long.
-    #[must_use]
-    pub const fn timing_out_after(mut self, timeout: Duration) -> Self {
-        self.timeout = Some(timeout);
-        self
-    }
-
     /// Connect to the broker as a client.
     ///
     /// # Errors
@@ -264,14 +256,12 @@ impl Configured for ActiveMqTransport {
                           /topic/prices: subscribed to on receive, the default target on send.",
                 applies: Applies::Both,
             },
-            Setting {
-                name: "timeout",
-                kind: Kind::Duration,
-                presence: Presence::Optional,
-                meaning: "How long a broker that stops mid-frame is waited on, and how long \
-                          a receive waits on a quiet destination; unbounded when left out.",
-                applies: Applies::Both,
-            },
+            transport::configured::timeout(
+                Applies::Both,
+                None,
+                "How long a broker that stops mid-frame is waited on, and how long \
+                 a receive waits on a quiet destination; unbounded when left out.",
+            ),
         ],
     };
 
@@ -283,13 +273,13 @@ impl Configured for ActiveMqTransport {
         transport::destination::OWN
     }
 
+    fn timeout_kept(&mut self) -> Option<&mut dyn transport::configured::TimeoutKept> {
+        Some(&mut self.timeout)
+    }
+
     fn configured(address: &str, settings: &Read) -> Result<Self> {
         // The login comes through the Location's credentials, not a setting.
-        let transport = Self::new(address, settings.text("destination"));
-        Ok(match settings.optional_duration("timeout") {
-            Some(timeout) => transport.timing_out_after(timeout),
-            None => transport,
-        })
+        Ok(Self::new(address, settings.text("destination")))
     }
 }
 
@@ -501,11 +491,15 @@ mod tests {
             let mut arrived = Vec::new();
             while arrived.len() < 6 {
                 let now = receiving.receive()?;
-                if !now.is_empty() {
-                    taken.send(()).expect("told");
-                }
+                let any = !now.is_empty();
                 for one in now {
                     arrived.push(one.taken()?.bytes);
+                }
+                // Told once each is acked: told before, the broker could
+                // close the subscription first, and the ACK find none to go
+                // on.
+                if any {
+                    taken.send(()).expect("told");
                 }
             }
             Ok::<_, transport::TransportError>(arrived)
