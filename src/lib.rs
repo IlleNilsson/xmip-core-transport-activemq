@@ -51,7 +51,14 @@ use xcore::settings::{Applies, Kind, Presence, Read, Setting, Settings};
 pub struct ActiveMqTransport {
     server: String,
     queue: String,
+    /// Who CONNECT presents as its `login`, where anyone, and the
+    /// `passcode` it presents where its Location names no secret; where it
+    /// names one, the secret's password replaces it at each connection
+    /// ([`transport::secured::logged_in`]).
     login: Option<Login>,
+    /// The secret its Location names, read at each connection (ADR-0019,
+    /// amendment 2026-11-25).
+    secret: Option<transport::Secured>,
     timeout: Option<Duration>,
     /// The clients a send goes on, connected once per broker and kept.
     clients: Pool<Client>,
@@ -69,27 +76,37 @@ impl ActiveMqTransport {
             server: server.into(),
             queue: queue.into(),
             login: None,
+            secret: None,
             timeout: None,
             clients: Pool::new(),
             subscriptions: Pool::new(),
         }
     }
 
-    /// CONNECT as this user.
+    /// CONNECT as `login`, and expect it when accepting.
     #[must_use]
-    #[cfg(test)]
-    fn with_login(mut self, user: &str, password: &str) -> Self {
-        self.login = Some(Login::new(user, password));
+    pub fn logging_in(mut self, login: Login) -> Self {
+        self.login = Some(login);
         self
     }
 
     /// Connect to the broker as a client.
     ///
     /// # Errors
-    /// Where the broker could not be reached, refused the login, or did
-    /// not speak STOMP.
+    /// Where the Location's secret could not be presented, or the broker
+    /// could not be reached, refused the login, or did not speak STOMP.
     pub fn connect(&self) -> Result<Client> {
-        Client::connect(&self.server, self.login.as_ref(), self.timeout)
+        self.connect_to(&self.server)
+    }
+
+    /// Connect to `server`, the password the Location's secret holds read
+    /// now where it names one: each new connection reads it, a kept one
+    /// never again.
+    fn connect_to(&self, server: &str) -> Result<Client> {
+        let presented =
+            |login: &Login| transport::secured::logged_in(login, self.secret.as_ref(), "activemq");
+        let login = self.login.as_ref().map(presented).transpose()?;
+        Client::connect(server, login.as_ref(), self.timeout)
     }
 
     /// Bind as the far end clients connect to, and report the address.
@@ -205,7 +222,7 @@ impl ActiveMqTransport {
         let (server, destination) = self.resolve(target);
         self.clients.exchange(
             &server,
-            || Client::connect(&server, self.login.as_ref(), self.timeout),
+            || self.connect_to(&server),
             |client| client.send(&destination, bytes, key),
         )
     }
@@ -243,8 +260,8 @@ fn answering(subscriptions: &Pool<Client>, server: &str, ack: String) -> Acknowl
 }
 
 impl Configured for ActiveMqTransport {
-    /// The address is the broker's STOMP listener, `host:61613`. The login
-    /// is the Location's credentials, not a setting: a secret never is.
+    /// The address is the broker's STOMP listener, `host:61613`. The
+    /// passcode is the secret the Location names, never a setting.
     const SETTINGS: &'static Settings = &Settings {
         technology: env!("CARGO_PKG_NAME"),
         settings: &[
@@ -254,6 +271,14 @@ impl Configured for ActiveMqTransport {
                 presence: Presence::Required,
                 meaning: "The queue or topic as the broker names it, /queue/orders or \
                           /topic/prices: subscribed to on receive, the default target on send.",
+                applies: Applies::Both,
+            },
+            Setting {
+                name: "user",
+                kind: Kind::Text,
+                presence: Presence::Optional,
+                meaning: "The login CONNECT presents, its passcode the Location's secret; no \
+                          login when left out.",
                 applies: Applies::Both,
             },
             transport::configured::timeout(
@@ -277,9 +302,25 @@ impl Configured for ActiveMqTransport {
         Some(&mut self.timeout)
     }
 
+    /// The passcode is not a setting: it is the secret the Location names;
+    /// the login is built without it.
     fn configured(address: &str, settings: &Read) -> Result<Self> {
-        // The login comes through the Location's credentials, not a setting.
-        Ok(Self::new(address, settings.text("destination")))
+        let mut transport = Self::new(address, settings.text("destination"));
+        transport.login = settings
+            .optional_text("user")
+            .map(|user| Login::new(user, ""));
+        Ok(transport)
+    }
+
+    /// The password the Location's secret holds, as the `passcode` beside
+    /// its `user`, read at each connection. A secret named without a user
+    /// is refused: it would go out as nobody's passcode.
+    fn secured_by(mut self, secret: transport::Secured) -> Result<Self> {
+        if self.login.is_none() {
+            return Err(transport::secured::without_user(&secret, "user"));
+        }
+        self.secret = Some(secret);
+        Ok(self)
     }
 }
 
@@ -352,7 +393,15 @@ mod tests {
         assert_eq!(transport.server, "broker:61613");
         assert_eq!(transport.queue, "/queue/orders");
         assert_eq!(transport.timeout, Some(secs(2)));
-        assert!(transport.login.is_none(), "the login is the credentials'");
+        assert!(transport.login.is_none(), "no user named: no login");
+        let mut named = given.to_vec();
+        named.push(("user".to_string(), Given::Text("orders".to_string())));
+        let built = ActiveMqTransport::open("broker:61613", Applies::Send, &named).expect("built");
+        assert_eq!(
+            built.login,
+            Some(Login::new("orders", "")),
+            "the passcode is the Location's secret, none named here"
+        );
         let Err(refused) = ActiveMqTransport::open("broker:61613", Applies::Send, &[]) else {
             panic!("destination is required");
         };
@@ -398,19 +447,19 @@ mod tests {
     #[test]
     fn a_receiver_acks_the_accepted_nacks_the_refused_and_leaves_the_failed_to_come_again() {
         let far_end = ActiveMqTransport::new("127.0.0.1:0", "/queue/orders")
-            .with_login("xmip", "secret")
+            .logging_in(Login::new("xmip", "secret"))
             .timing_out_after(secs(2));
         let (listener, address) = far_end.bind().expect("binding");
         let sender = std::thread::spawn(move || {
             let near = ActiveMqTransport::new(address.clone(), "/queue/orders")
-                .with_login("xmip", "secret")
+                .logging_in(Login::new("xmip", "secret"))
                 .timing_out_after(secs(2));
             near.send("/queue/orders", b"order 1\r\nline 2")?;
             near.send(&format!("activemq://{address}/queue/orders"), b"")?;
             near.send(&format!("{address}/queue/other"), b"other")?;
             near.send("/queue/orders", b"order 3")?;
             let receiving = ActiveMqTransport::new(address, "/queue/orders")
-                .with_login("xmip", "secret")
+                .logging_in(Login::new("xmip", "secret"))
                 .timing_out_after(Duration::from_millis(300));
             let mut arrived = receiving.receive()?.into_iter();
             let one = arrived.next().expect("one").taken()?;
@@ -479,11 +528,11 @@ mod tests {
     #[test]
     fn five_receives_subscribe_once_and_a_subscription_the_broker_closed_is_replaced() {
         let far_end = ActiveMqTransport::new("127.0.0.1:0", "/queue/orders")
-            .with_login("xmip", "secret")
+            .logging_in(Login::new("xmip", "secret"))
             .timing_out_after(secs(5));
         let (listener, address) = far_end.bind().expect("binding");
         let near = ActiveMqTransport::new(address, "/queue/orders")
-            .with_login("xmip", "secret")
+            .logging_in(Login::new("xmip", "secret"))
             .timing_out_after(Duration::from_millis(100));
         let receiving = near.clone();
         let (taken, told) = std::sync::mpsc::channel();
@@ -530,11 +579,11 @@ mod tests {
     fn a_thousand_sends_connect_once_and_a_client_the_broker_closed_is_replaced() {
         const SENDS: usize = 1000;
         let far_end = ActiveMqTransport::new("127.0.0.1:0", "/queue/orders")
-            .with_login("xmip", "secret")
+            .logging_in(Login::new("xmip", "secret"))
             .timing_out_after(secs(5));
         let (listener, address) = far_end.bind().expect("binding");
         let near = ActiveMqTransport::new(address, "/queue/orders")
-            .with_login("xmip", "secret")
+            .logging_in(Login::new("xmip", "secret"))
             .timing_out_after(secs(5));
         let sending = near.clone();
         let sender = std::thread::spawn(move || {
@@ -591,7 +640,7 @@ mod tests {
         // megabytes the client sent after its CONNECT unread, which a bare
         // drop resets away on Windows.
         let far_end = ActiveMqTransport::new("127.0.0.1:0", "/queue/x")
-            .with_login("xmip", "secret")
+            .logging_in(Login::new("xmip", "secret"))
             .timing_out_after(secs(2));
         let (listener, address) = far_end.bind().expect("binding");
         let serving = std::thread::spawn(move || far_end.accept_one(&listener).err());
@@ -614,12 +663,12 @@ mod tests {
     #[test]
     fn a_refused_login_and_a_broker_that_is_not_stomp_are_permanent() {
         let far_end = ActiveMqTransport::new("127.0.0.1:0", "/queue/x")
-            .with_login("xmip", "secret")
+            .logging_in(Login::new("xmip", "secret"))
             .timing_out_after(secs(2));
         let (listener, address) = far_end.bind().expect("binding");
         let stranger = std::thread::spawn(move || {
             ActiveMqTransport::new(address, "/queue/x")
-                .with_login("xmip", "wrong")
+                .logging_in(Login::new("xmip", "wrong"))
                 .timing_out_after(secs(2))
                 .connect()
                 .err()
@@ -672,6 +721,56 @@ mod tests {
             transport.resolve(""),
             ("127.0.0.1:0".to_string(), "/queue/x".to_string())
         );
+    }
+
+    #[test]
+    fn the_passcode_is_the_locations_secret_read_at_each_connection() {
+        use transport::secured::Kept;
+        use xcore::SecretKind::Password;
+        let kept = std::sync::Arc::new(Kept::default());
+        let drawn = Kept::drawn();
+        let far_end = ActiveMqTransport::new("127.0.0.1:0", "/queue/orders")
+            .logging_in(Login::new("orders", &drawn))
+            .timing_out_after(secs(2));
+        let (listener, address) = far_end.bind().expect("binding");
+        let text = |name: &str, value: &str| (name.to_string(), Given::Text(value.to_string()));
+        let given = [
+            text("destination", "/queue/orders"),
+            text("user", "orders"),
+            text("timeout", "2s"),
+        ];
+        let location = format!("activemq://{address}");
+        let near = ActiveMqTransport::open(&location, Applies::Send, &given)
+            .expect("built")
+            .secured_by(kept.secured("partner-x.activemq"))
+            .expect("a user is named");
+        let unset = near.send("/queue/orders", b"x").expect_err("not set");
+        assert!(unset.retryable, "asked again at the next connection");
+        assert!(unset.message.contains("is not set"), "{unset}");
+
+        kept.set("partner-x.activemq", Password, &format!("{drawn}-wrong"));
+        let sending = near.clone();
+        let sender = std::thread::spawn(move || sending.send("/queue/orders", b"x").err());
+        let refused = far_end.accept_one(&listener).err().expect("refused");
+        assert!(refused.message.contains("not authorized"), "{refused}");
+        let wrong = sender.join().expect("thread").expect("refused");
+        assert!(wrong.message.contains("ERROR: not authorized"), "{wrong}");
+        assert!(!wrong.retryable, "{wrong}");
+
+        kept.set("partner-x.activemq", Password, &drawn);
+        let sending = near.clone();
+        let sender = std::thread::spawn(move || sending.send("/queue/orders", b"right"));
+        let mut session = far_end.accept_one(&listener).expect("admitted");
+        assert_eq!(session.connect().header("login"), Some("orders"));
+        let sent = session.next_send().expect("sent").expect("one");
+        assert_eq!(sent.bytes, b"right");
+        sender.join().expect("thread").expect("sent");
+
+        let unnamed = ActiveMqTransport::open(&location, Applies::Send, &given[..1]);
+        let Err(refused) = unnamed.expect("built").secured_by(kept.secured("x")) else {
+            panic!("no user is named");
+        };
+        assert!(refused.message.contains("\"user\" setting"), "{refused}");
     }
 
     #[test]
