@@ -24,29 +24,49 @@
 //! `host:61613/queue/orders`, or a destination alone on this transport's
 //! broker. The origin URI carries what the frame knew:
 //! `activemq://server/queue/orders?message-id=ID:broker-1234`.
+//!
+//! **Built with its `declaration` feature alone** the crate is
+//! [`declaration`], what a Location of it is configured with, and none of
+//! the code above, which is behind the default feature: what the surfaces'
+//! library carries (ADR-0064, amendment 2026-11-26).
 
+#[cfg(feature = "default")]
 pub mod client;
+#[cfg(feature = "declaration")]
+pub mod declaration;
+#[cfg(feature = "default")]
 pub mod frame;
+#[cfg(feature = "default")]
 pub mod session;
 
+#[cfg(feature = "default")]
 use std::net::TcpListener;
+#[cfg(feature = "default")]
 use std::time::Duration;
 
+#[cfg(feature = "default")]
 pub use client::{Client, Message};
+#[cfg(feature = "default")]
 pub use frame::Frame;
+#[cfg(feature = "default")]
 use net::Target;
+#[cfg(feature = "default")]
 pub use session::{Event, Queues, Session};
+#[cfg(feature = "default")]
 use transport::error::{Result, protocol_error};
+#[cfg(feature = "default")]
 use transport::listening::{Accepting, Listening};
+#[cfg(feature = "default")]
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
-use transport::pool::delivered;
-use transport::socket;
+#[cfg(feature = "default")]
 use transport::{
     Acknowledgement, ArrivalIdentity, Arrived, Configured, Directions, Headers, Login, Pool, Taken,
-    Transport, Verdict,
+    Transport, Verdict, pool::delivered, socket,
 };
-use xcore::settings::{Applies, Kind, Presence, Read, Setting, Settings};
+#[cfg(feature = "default")]
+use xcore::settings::{Read, Settings};
 
+#[cfg(feature = "default")]
 #[derive(Clone)]
 pub struct ActiveMqTransport {
     server: String,
@@ -67,6 +87,7 @@ pub struct ActiveMqTransport {
     subscriptions: Pool<Client>,
 }
 
+#[cfg(feature = "default")]
 impl ActiveMqTransport {
     /// Speak to the broker at `server` about `queue` — a destination as
     /// the broker names it, `/queue/orders` or `/topic/prices`.
@@ -144,6 +165,7 @@ impl ActiveMqTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl Transport for ActiveMqTransport {
     fn name(&self) -> &'static str {
         "activemq"
@@ -216,6 +238,7 @@ impl Transport for ActiveMqTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl ActiveMqTransport {
     /// The one send, on the client kept for the target's broker.
     fn send_under(&self, target: &str, bytes: &[u8], key: Option<&str>) -> Result<()> {
@@ -239,6 +262,7 @@ impl ActiveMqTransport {
 /// only, so the answer goes on the kept subscription or not at all: where
 /// the broker closed it meanwhile, no other is opened, and the broker
 /// delivers again what that connection had not answered.
+#[cfg(feature = "default")]
 fn answering(subscriptions: &Pool<Client>, server: &str, ack: String) -> Acknowledgement {
     let subscriptions = subscriptions.clone();
     let server = server.to_string();
@@ -259,39 +283,10 @@ fn answering(subscriptions: &Pool<Client>, server: &str, ack: String) -> Acknowl
     })
 }
 
+#[cfg(feature = "default")]
 impl Configured for ActiveMqTransport {
-    /// The address is the broker's STOMP listener, `host:61613`. The
-    /// passcode is the secret the Location names, never a setting.
-    const SETTINGS: &'static Settings = &Settings {
-        technology: env!("CARGO_PKG_NAME"),
-        settings: &[
-            Setting {
-                name: "destination",
-                kind: Kind::Text,
-                presence: Presence::Required,
-                meaning: "The queue or topic as the broker names it, /queue/orders or \
-                          /topic/prices: subscribed to on receive, the default target on send.",
-                applies: Applies::Both,
-            },
-            Setting {
-                name: "user",
-                kind: Kind::Text,
-                presence: Presence::Optional,
-                meaning: "The login CONNECT presents, its passcode the Location's secret; no \
-                          login when left out.",
-                applies: Applies::Both,
-            },
-            transport::configured::timeout(
-                Applies::Both,
-                None,
-                "How long a broker that stops mid-frame is waited on, and how long \
-                 a receive waits on a quiet destination; unbounded when left out.",
-            ),
-        ],
-    };
-
-    /// The schemes a Location's address is entered with to choose this technology.
-    const SCHEMES: &'static [&'static str] = &["activemq"];
+    const SETTINGS: &'static Settings = declaration::SETTINGS;
+    const SCHEMES: &'static [&'static str] = declaration::SCHEMES;
 
     /// The destination setting: the address names only the broker.
     fn own_target(_address: &str) -> &str {
@@ -324,6 +319,7 @@ impl Configured for ActiveMqTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl ActiveMqTransport {
     /// Both ends on this machine: an ephemeral local port, the loopback
     /// timeout, one queue called `/queue/probe`.
@@ -333,6 +329,7 @@ impl ActiveMqTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl Accepting for ActiveMqTransport {
     fn take_one(self, listener: &TcpListener) -> Result<Taken> {
         let mut session = self.accept_one(listener)?;
@@ -344,6 +341,7 @@ impl Accepting for ActiveMqTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl Loopback for ActiveMqTransport {
     fn arrival_identity(&self) -> ArrivalIdentity {
         ArrivalIdentity::Unnamed(
@@ -372,7 +370,7 @@ mod tests {
     use std::assert_matches;
     use transport::arrived::next_arrival;
     use transport::payload::{edge_payloads, sized_payloads};
-    use xcore::settings::Given;
+    use xcore::settings::{Applies, Given};
 
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)

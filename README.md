@@ -18,6 +18,10 @@ A Send Location sends to the destination its `destination` setting names, on the
 
 A keyed send (the key `Transport::send_from` is handed, `Outgoing::key`; built 2026-10-04) carries the Journey's identifier in the SEND frame's `_AMQ_DUPL_ID` header (`client::DUPLICATE_ID`), the same on every attempt on one Journey. Artemis takes a STOMP header as a message property, and this one is its duplicate detection id: a SEND whose id the address already holds within its cache is dropped. `ActiveMQ` Classic has no such detection over STOMP and hands the header to its consumer as a property, which recognizes the repeat by it. An unkeyed `send` carries none.
 
+## The declaration
+
+What a Location of this technology is configured with is two `const`s in its `declaration` module, `src/declaration.rs`, beside the code, which `Configured` reads (ADR-0064, amendment 2026-11-26): `declaration::SETTINGS`, `destination`, `user` and `timeout`, and `SCHEMES`, `activemq`. Built with its `declaration` feature alone (`--no-default-features --features declaration`), the crate is those and nothing more: its code and every crate the code is built on are behind the default feature. So the library the surfaces load can carry it without the code, for the language server and the desktop to suggest and check an `ActiveMQ` Location's settings though no node in their process loaded the technology, once the gathering crate of open problem 48 links it. `test/Declaration.Test.ps1` in the estate holds that the declaration builds nothing the transport capability does not.
+
 ## Toolchain
 
 `rust-toolchain.toml` pins the toolchain for the whole estate. Do not change it
